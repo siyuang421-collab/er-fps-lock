@@ -1,0 +1,2266 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CheatTable CheatEngineTableVersion="46">
+  <CheatEntries>
+    <CheatEntry>
+      <ID>1</ID>
+      <Description>"FPS Patch [OFF]"</Description>
+      <Color>FFFFFF</Color>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+-- 互斥：位置触发(101)已激活时阻止启用 FPS Patch
+do
+  local _r101 = getAddressList().getMemoryRecordByID(101)
+  if _r101 and _r101.Active then
+    pcall(getMainForm().bringToFront)
+    pcall(showMessage, "请先关闭位置触发自动锁帧，再开启 FPS Patch")
+    local _self = getAddressList().getMemoryRecordByID(1)
+    local _gt = createTimer(nil)
+    _gt.Interval = 100
+    _gt.OnTimer = function() pcall(function() _self.Active = false end) _gt.destroy() end
+    return
+  end
+end
+_G.__ER_FPS_WANTED = true
+pcall(writeBytes, "ER_FPS_PATCH_ENABLED", 1)
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+_G.__ER_FPS_WANTED = false
+pcall(writeBytes, "ER_FPS_PATCH_ENABLED", 0)</AssemblerScript>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>2</ID>
+      <Description>"FPS限制"</Description>
+      <ShowAsSigned>0</ShowAsSigned>
+      <Color>FFFFFF</Color>
+      <VariableType>Float</VariableType>
+      <Address>ER_FPS_CUSTOM_LIMIT</Address>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>3</ID>
+      <Description>"[使用说明]"</Description>
+      <Options moHideChildren="1"/>
+      <Color>0000FF</Color>
+      <GroupHeader>1</GroupHeader>
+      <CheatEntries>
+        <CheatEntry>
+          <ID>4</ID>
+          <Description>"- 勾选FPS Patch启用锁帧，勾选位置触发可自动切换"</Description>
+          <Color>00FFFF</Color>
+          <GroupHeader>1</GroupHeader>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>5</ID>
+          <Description>"- 走到开锁点附近自动启用并写入该点帧数，走到关锁点自动关闭"</Description>
+          <Color>00FFFF</Color>
+          <GroupHeader>1</GroupHeader>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>6</ID>
+          <Description>"- 勾选列表行可删除该点，改FPS按钮可修改开锁点帧数(20-60)"</Description>
+          <Color>00FFFF</Color>
+          <GroupHeader>1</GroupHeader>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>7</ID>
+          <Description>"- 需配合注入DLL，符号未就绪时显示WAIT会自动等待"</Description>
+          <Color>00FFFF</Color>
+          <GroupHeader>1</GroupHeader>
+        </CheatEntry>
+      </CheatEntries>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>100</ID>
+      <Description>"位置触发自动锁帧"</Description>
+      <Color>00FFCC</Color>
+      <GroupHeader>1</GroupHeader>
+      <CheatEntries>
+        <CheatEntry>
+          <ID>101</ID>
+          <Description>"启用位置触发 [OFF]"</Description>
+          <Color>FFFFFF</Color>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+-- ============================================================
+-- ID 101 位置触发主开关 ENABLE 脚本（纯 Lua 版，用于语法验证）
+-- ============================================================
+local MAXSLOT    = 80
+local SLOTSIZE   = 24
+local RADIUS_OFF = 0x800
+
+-- 互斥：FPS Patch(ID1) 已激活时，阻止启用位置触发（GUI 点击必然执行此段）
+do
+  local _r1 = getAddressList().getMemoryRecordByID(1)
+  if _r1 and _r1.Active then
+    pcall(getMainForm().bringToFront)
+    pcall(showMessage, "请先关闭 FPS Patch，再启用位置触发自动锁帧")
+    local _self = getAddressList().getMemoryRecordByID(101)
+    local _gt = createTimer(nil)
+    _gt.Interval = 100
+    _gt.OnTimer = function()
+      pcall(function() _self.Active = false end)
+      _gt.destroy()
+    end
+    return
+  end
+end
+
+_G.AutoFps_Active = true
+
+if _G.AutoFps_Timer then
+  pcall(function() _G.AutoFps_Timer.destroy() end)
+  _G.AutoFps_Timer = nil
+end
+
+-- 分配内存
+if not _G.AutoFps_Config then
+  _G.AutoFps_Config = allocateMemory(2304)
+  registerSymbol("AutoFps_Config", _G.AutoFps_Config)
+end
+local cfg = _G.AutoFps_Config
+
+-- 记录启用位置触发前的手动帧率（关闭时若需恢复手动帧用）
+pcall(function() _G.AutoFps_ManualLimit = readFloat("ER_FPS_CUSTOM_LIMIT") end)
+
+-- 默认半径
+if readFloat(cfg + RADIUS_OFF) == 0 then
+  writeFloat(cfg + RADIUS_OFF, 5.0)
+end
+
+-- 从保存文件恢复上次的点位（文件不存在则跳过）
+if _G.AutoFps_Load then pcall(_G.AutoFps_Load, cfg) end
+
+_G.AutoFps_EntrySlot = {}
+local descCache = {}
+
+-- AOB 扫描：得到固定的全局指针变量地址（实例会随坐赐福/传送变化，不能缓存实例）
+local function scanWcm()
+  pcall(unregisterSymbol, "WorldChrMan_AOB")
+  local ok = autoAssemble([[
+aobscanmodule(WorldChrMan_AOB, eldenring.exe, 48 8B 05 ?? ?? ?? ?? 48 85 C0 74 0F 48 39 88)
+registersymbol(WorldChrMan_AOB)
+]])
+  if not ok then return false end
+  local scanAddr = getAddressSafe("WorldChrMan_AOB")
+  if not scanAddr or scanAddr == 0 then return false end
+  local disp = readInteger(scanAddr + 3)
+  _G.AutoFps_PtrVarAddr = scanAddr + 7 + disp
+  return _G.AutoFps_PtrVarAddr ~= 0
+end
+
+-- 每次从固定指针变量读取当前 WorldChrMan 实例（坐赐福/传送后自动拿到新实例）
+local function getWcm()
+  if not _G.AutoFps_PtrVarAddr or _G.AutoFps_PtrVarAddr == 0 then return 0 end
+  local inst = readQword(_G.AutoFps_PtrVarAddr)
+  if inst and inst ~= 0 then
+    _G.AutoFps_WorldChrAddr = inst
+    return inst
+  end
+  return 0
+end
+
+local function readPos()
+  local wcm = getWcm()
+  if not wcm or wcm == 0 then return nil end
+  local p1 = readQword(wcm + 0x10EF8)
+  if p1 == 0 then return nil end
+  local co = readQword(p1 + 0)
+  if co == 0 then return nil end
+  return {
+    mapID = readInteger(co + 0x6D0),
+    x = readFloat(co + 0x6C0),
+    y = readFloat(co + 0x6C4),
+    z = readFloat(co + 0x6C8)
+  }
+end
+
+local function mapIdToStr(id)
+  if not id or id == 0 then return "未设置" end
+  local b3 = math.floor(id / 0x1000000) % 256
+  local b2 = math.floor(id / 0x10000) % 256
+  local b1 = math.floor(id / 0x100) % 256
+  local b0 = id % 256
+  return string.format("m%d_%02d_%02d_%02d", b3, b2, b1, b0)
+end
+
+local function setDesc(eid, text)
+  if descCache[eid] ~= text then
+    descCache[eid] = text
+    local rec = getAddressList().getMemoryRecordByID(eid)
+    if rec then rec.Description = text end
+  end
+end
+
+-- 列表刷新
+local function refreshList()
+  _G.AutoFps_EntrySlot = {}
+  local openLine = 0
+  local closeLine = 0
+  for i = 0, MAXSLOT - 1 do
+    local off = i * SLOTSIZE
+    local mID = readInteger(cfg + off)
+    if mID ~= 0 then
+      local st = readInteger(cfg + off + 16)
+      local sx = readFloat(cfg + off + 4)
+      local sy = readFloat(cfg + off + 8)
+      local sz = readFloat(cfg + off + 12)
+      local fps = readFloat(cfg + off + 20)
+      if st == 1 and openLine &lt; 40 then
+        openLine = openLine + 1
+        local eid = 200 + openLine - 1
+        _G.AutoFps_EntrySlot[eid] = i
+        setDesc(eid, string.format("%d. %s [%.0f帧] (%.1f,%.1f,%.1f)",
+          openLine, mapIdToStr(mID), fps, sx, sy, sz))
+      elseif st == 2 and closeLine &lt; 40 then
+        closeLine = closeLine + 1
+        local eid = 300 + closeLine - 1
+        _G.AutoFps_EntrySlot[eid] = i
+        setDesc(eid, string.format("%d. %s (%.1f,%.1f,%.1f)",
+          closeLine, mapIdToStr(mID), sx, sy, sz))
+      end
+    end
+  end
+  for k = openLine, 39 do setDesc(200 + k, " ") end
+  for k = closeLine, 39 do setDesc(300 + k, " ") end
+end
+
+-- 触发检测
+local function checkTrigger(p)
+  local radius = readFloat(cfg + RADIUS_OFF)
+  for i = 0, MAXSLOT - 1 do
+    local off = i * SLOTSIZE
+    local mID = readInteger(cfg + off)
+    if mID ~= 0 and p.mapID == mID then
+      local sx = readFloat(cfg + off + 4)
+      local sy = readFloat(cfg + off + 8)
+      local sz = readFloat(cfg + off + 12)
+      local st = readInteger(cfg + off + 16)
+      local fps = readFloat(cfg + off + 20)
+      local d = math.sqrt((p.x - sx)^2 + (p.y - sy)^2 + (p.z - sz)^2)
+      if d &lt; radius then
+        if st == 1 then
+          pcall(writeBytes, "ER_FPS_PATCH_ENABLED", 1)
+          if fps &gt;= 20 and fps &lt;= 60 then
+            pcall(writeFloat, "ER_FPS_CUSTOM_LIMIT", fps)
+          end
+          _G.__ER_FPS_WANTED = true
+          setDesc(1, string.format("FPS Patch [%.0f 自动]", fps))
+        elseif st == 2 then
+          pcall(writeBytes, "ER_FPS_PATCH_ENABLED", 0)
+          _G.__ER_FPS_WANTED = false
+          setDesc(1, "FPS Patch [OFF 自动]")
+        end
+      end
+    end
+  end
+end
+
+local saveCounter = 0
+_G.AutoFps_Timer = createTimer(getMainForm())
+_G.AutoFps_Timer.Interval = 500
+_G.AutoFps_Timer.OnTimer = function()
+  pcall(function()
+    setDesc(102, string.format("触发半径(米): %.1f  [点击修改]", readFloat(cfg + RADIUS_OFF)))
+    -- 指针变量地址固定，仅在尚未扫描到（或游戏重启后失效）时重新扫描；
+    -- 实例地址每次由 getWcm() 重新读取，坐赐福/传送后自动更新
+    if not _G.AutoFps_PtrVarAddr or _G.AutoFps_PtrVarAddr == 0 then
+      scanWcm()
+    end
+    -- 列表刷新独立于角色读取：即使读不到角色位置，点位列表也要显示
+    refreshList()
+    local p = readPos()
+    if not p then
+      setDesc(150, "当前位置：读不到")
+    else
+      setDesc(150, "当前位置：" .. mapIdToStr(p.mapID) ..
+        string.format(" (%.1f,%.1f,%.1f)", p.x, p.y, p.z))
+      checkTrigger(p)
+    end
+    -- 每 10 次 tick（约 5 秒）自动保存一次，防止 CE 崩溃/强杀丢失点位
+    saveCounter = saveCounter + 1
+    if saveCounter &gt;= 10 then
+      saveCounter = 0
+      if _G.AutoFps_Save then _G.AutoFps_Save(cfg) end
+    end
+  end)
+end
+
+getAddressList().getMemoryRecordByID(101).Description = "启用位置触发 [ON]"
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+-- ID 101 DISABLE 清理脚本
+if syntaxcheck then return end
+_G.AutoFps_Active = false
+_G.__ER_FPS_RESYNC = true
+
+-- 关闭位置触发时恢复帧率：判断用户是否手动开着 FPS Patch(ID1)
+local id1 = getAddressList().getMemoryRecordByID(1)
+local manualPatch = (id1 ~= nil) and id1.Active
+if manualPatch then
+  -- 手动锁帧：保持 patch，恢复到启用位置触发前的手动帧率
+  _G.__ER_FPS_WANTED = true
+  pcall(writeBytes, "ER_FPS_PATCH_ENABLED", 1)
+  local ml = _G.AutoFps_ManualLimit
+  if ml and ml &gt;= 20 and ml &lt;= 60 then
+    pcall(writeFloat, "ER_FPS_CUSTOM_LIMIT", ml)
+  end
+else
+  -- 纯位置触发：关闭 patch，解除锁帧让游戏恢复原生帧率
+  _G.__ER_FPS_WANTED = false
+  pcall(writeBytes, "ER_FPS_PATCH_ENABLED", 0)
+end
+
+if _G.AutoFps_Timer then
+  pcall(function() _G.AutoFps_Timer.destroy() end)
+  _G.AutoFps_Timer = nil
+end
+
+if _G.AutoFps_Config then
+  -- 释放内存前先保存到文件
+  if _G.AutoFps_Save then pcall(_G.AutoFps_Save, _G.AutoFps_Config) end
+  pcall(unregisterSymbol, "AutoFps_Config")
+  pcall(deAlloc, _G.AutoFps_Config, 2304)
+  _G.AutoFps_Config = nil
+end
+
+pcall(unregisterSymbol, "WorldChrMan_AOB")
+_G.AutoFps_WorldChrAddr = 0
+_G.AutoFps_PtrVarAddr = 0
+
+for eid = 200, 239 do
+  local rec = getAddressList().getMemoryRecordByID(eid)
+  if rec then rec.Description = " " end
+end
+for eid = 300, 339 do
+  local rec = getAddressList().getMemoryRecordByID(eid)
+  if rec then rec.Description = " " end
+end
+
+local r101 = getAddressList().getMemoryRecordByID(101)
+if r101 then r101.Description = "启用位置触发 [OFF]" end</AssemblerScript>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>102</ID>
+          <Description>"触发半径(米): 5.0  [点击修改]"</Description>
+          <Color>FFAA00</Color>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+if not _G.AutoFps_Config then getMemoryRecordByID(102).Active=false return end
+local r = readFloat(_G.AutoFps_Config + 0x800)
+local ans = inputQuery("触发半径", "输入触发半径(米):", string.format("%.1f", r))
+if ans == nil then getMemoryRecordByID(102).Active=false return end
+local nr = tonumber(ans)
+if not nr or nr &lt;= 0 or nr &gt; 1000 then getMemoryRecordByID(102).Active=false return end
+writeFloat(_G.AutoFps_Config + 0x800, nr)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end
+getMemoryRecordByID(102).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>150</ID>
+          <Description>"当前位置：读不到"</Description>
+          <Color>00FFFF</Color>
+          <GroupHeader>1</GroupHeader>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>151</ID>
+          <Description>"点位保存在: ..."</Description>
+          <Color>88FF88</Color>
+          <GroupHeader>1</GroupHeader>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>161</ID>
+          <Description>"➕ 添加开锁点"</Description>
+          <Color>00FF66</Color>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+if not _G.AutoFps_Config then getMemoryRecordByID(161).Active=false return end
+local wcm = (_G.AutoFps_PtrVarAddr and readQword(_G.AutoFps_PtrVarAddr)) or 0
+if not wcm or wcm == 0 then getMemoryRecordByID(161).Active=false return end
+local p1 = readQword(wcm + 0x10EF8)
+local co = readQword(p1 + 0)
+local mID = readInteger(co+0x6D0)
+local pX = readFloat(co+0x6C0)
+local pY = readFloat(co+0x6C4)
+local pZ = readFloat(co+0x6C8)
+local curFps = 45
+pcall(function()
+  local v = getAddressList().getMemoryRecordByID(2).Value
+  if v and v &gt;= 20 and v &lt;= 60 then curFps = v end
+end)
+local slot = -1
+for i = 0, 79 do
+  if readInteger(_G.AutoFps_Config + i*24) == 0 then slot = i break end
+end
+if slot &lt; 0 then getMemoryRecordByID(161).Active=false return end
+local off = slot * 24
+writeInteger(_G.AutoFps_Config+off, mID)
+writeFloat(_G.AutoFps_Config+off+4, pX)
+writeFloat(_G.AutoFps_Config+off+8, pY)
+writeFloat(_G.AutoFps_Config+off+12, pZ)
+writeInteger(_G.AutoFps_Config+off+16, 1)
+writeFloat(_G.AutoFps_Config+off+20, curFps)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end
+getMemoryRecordByID(161).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>162</ID>
+          <Description>"➕ 添加关锁点"</Description>
+          <Color>FF6666</Color>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+if not _G.AutoFps_Config then getMemoryRecordByID(162).Active=false return end
+local wcm = (_G.AutoFps_PtrVarAddr and readQword(_G.AutoFps_PtrVarAddr)) or 0
+if not wcm or wcm == 0 then getMemoryRecordByID(162).Active=false return end
+local p1 = readQword(wcm + 0x10EF8)
+local co = readQword(p1 + 0)
+local mID = readInteger(co+0x6D0)
+local pX = readFloat(co+0x6C0)
+local pY = readFloat(co+0x6C4)
+local pZ = readFloat(co+0x6C8)
+local slot = -1
+for i = 0, 79 do
+  if readInteger(_G.AutoFps_Config + i*24) == 0 then slot = i break end
+end
+if slot &lt; 0 then getMemoryRecordByID(162).Active=false return end
+local off = slot * 24
+writeInteger(_G.AutoFps_Config+off, mID)
+writeFloat(_G.AutoFps_Config+off+4, pX)
+writeFloat(_G.AutoFps_Config+off+8, pY)
+writeFloat(_G.AutoFps_Config+off+12, pZ)
+writeInteger(_G.AutoFps_Config+off+16, 2)
+writeFloat(_G.AutoFps_Config+off+20, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end
+getMemoryRecordByID(162).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>163</ID>
+          <Description>"✏ 改FPS"</Description>
+          <Color>FFAA00</Color>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local rec163 = getMemoryRecordByID(163)
+local ok, err = pcall(function()
+  if not _G.AutoFps_Config then return end
+  -- 窗口前置，避免对话框被全屏游戏遮挡
+  pcall(getMainForm().bringToFront)
+  -- 自包含统计开锁点，不依赖可能被 timer 重建的 EntrySlot
+  local openSlots = {}
+  for i = 0, 79 do
+    local off = i*24
+    local mID = readInteger(_G.AutoFps_Config + off)
+    if mID and mID ~= 0 and readInteger(_G.AutoFps_Config + off + 16) == 1 then
+      openSlots[#openSlots + 1] = i
+    end
+  end
+  if #openSlots == 0 then showMessage("还没有开锁点，请先添加") return end
+  local slot
+  if #openSlots == 1 then
+    slot = openSlots[1]
+  else
+    local line = inputQuery("改FPS", "输入开锁点行号(1-" .. #openSlots .. "):", "1")
+    if line == nil then return end
+    local num = tonumber(line)
+    if not num or num &lt; 1 or num &gt; #openSlots then return end
+    slot = openSlots[num]
+  end
+  local curFps = readFloat(_G.AutoFps_Config + slot*24 + 20)
+  local newFps = inputQuery("改FPS", "输入新帧数(20-60):", string.format("%.0f", curFps))
+  if newFps == nil then return end
+  local fps = tonumber(newFps)
+  if not fps or fps &lt; 20 or fps &gt; 60 then showMessage("帧数需在20-60之间") return end
+  writeFloat(_G.AutoFps_Config + slot*24 + 20, fps)
+  -- 若当前锁帧已激活，立即把新帧率写入实际限制，马上生效
+  local okb, b = pcall(readBytes, "ER_FPS_PATCH_ENABLED", 1, false)
+  if okb and b == 1 then
+    pcall(writeFloat, "ER_FPS_CUSTOM_LIMIT", fps)
+  end
+  if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end
+end)
+if not ok then
+  pcall(getMainForm().bringToFront)
+  pcall(showMessage, "改FPS出错: " .. tostring(err))
+end
+rec163.Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>164</ID>
+          <Description>"🗑 清空所有点"</Description>
+          <Color>888888</Color>
+          <VariableType>Auto Assembler Script</VariableType>
+          <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+if not _G.AutoFps_Config then getMemoryRecordByID(164).Active=false return end
+for i = 0, 79 do
+  writeInteger(_G.AutoFps_Config + i*24, 0)
+  writeInteger(_G.AutoFps_Config + i*24 + 16, 0)
+  writeFloat(_G.AutoFps_Config + i*24 + 20, 0)
+end
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end
+getMemoryRecordByID(164).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>180</ID>
+          <Description>"── 开锁点列表(勾选行删除) ──"</Description>
+          <Color>00FF66</Color>
+          <GroupHeader>1</GroupHeader>
+          <CheatEntries>
+            <CheatEntry>
+              <ID>200</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[200]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(200).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>201</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[201]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(201).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>202</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[202]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(202).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>203</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[203]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(203).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>204</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[204]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(204).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>205</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[205]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(205).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>206</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[206]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(206).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>207</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[207]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(207).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>208</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[208]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(208).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>209</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[209]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(209).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>210</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[210]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(210).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>211</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[211]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(211).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>212</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[212]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(212).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>213</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[213]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(213).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>214</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[214]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(214).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>215</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[215]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(215).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>216</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[216]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(216).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>217</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[217]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(217).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>218</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[218]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(218).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>219</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[219]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(219).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>220</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[220]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(220).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>221</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[221]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(221).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>222</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[222]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(222).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>223</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[223]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(223).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>224</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[224]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(224).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>225</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[225]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(225).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>226</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[226]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(226).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>227</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[227]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(227).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>228</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[228]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(228).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>229</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[229]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(229).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>230</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[230]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(230).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>231</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[231]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(231).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>232</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[232]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(232).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>233</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[233]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(233).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>234</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[234]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(234).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>235</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[235]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(235).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>236</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[236]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(236).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>237</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[237]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(237).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>238</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[238]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(238).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>239</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[239]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(239).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+          </CheatEntries>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>181</ID>
+          <Description>"── 关锁点列表(勾选行删除) ──"</Description>
+          <Color>FF6666</Color>
+          <GroupHeader>1</GroupHeader>
+          <CheatEntries>
+            <CheatEntry>
+              <ID>300</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[300]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(300).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>301</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[301]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(301).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>302</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[302]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(302).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>303</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[303]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(303).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>304</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[304]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(304).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>305</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[305]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(305).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>306</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[306]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(306).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>307</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[307]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(307).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>308</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[308]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(308).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>309</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[309]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(309).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>310</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[310]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(310).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>311</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[311]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(311).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>312</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[312]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(312).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>313</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[313]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(313).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>314</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[314]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(314).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>315</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[315]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(315).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>316</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[316]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(316).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>317</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[317]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(317).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>318</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[318]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(318).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>319</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[319]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(319).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>320</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[320]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(320).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>321</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[321]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(321).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>322</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[322]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(322).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>323</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[323]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(323).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>324</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[324]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(324).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>325</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[325]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(325).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>326</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[326]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(326).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>327</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[327]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(327).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>328</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[328]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(328).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>329</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[329]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(329).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>330</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[330]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(330).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>331</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[331]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(331).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>332</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[332]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(332).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>333</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[333]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(333).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>334</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[334]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(334).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>335</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[335]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(335).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>336</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[336]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(336).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>337</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[337]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(337).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>338</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[338]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(338).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+            <CheatEntry>
+              <ID>339</ID>
+              <Description>" "</Description>
+              <Color>CCCCCC</Color>
+              <VariableType>Auto Assembler Script</VariableType>
+              <AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+local s = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[339]
+if s then writeInteger(_G.AutoFps_Config + s*24, 0)
+if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end end
+getMemoryRecordByID(339).Active=false
+[DISABLE]
+{$lua}
+</AssemblerScript>
+            </CheatEntry>
+          </CheatEntries>
+        </CheatEntry>
+      </CheatEntries>
+    </CheatEntry>
+  </CheatEntries>
+  <UserdefinedSymbols/>
+  <LuaScript>-- ============================================================
+-- 顶层脚本：UI 美化 + 自动附加 + DLL 符号等待 + FPS 持久化
+-- ============================================================
+
+-- ---------- UI 美化 ----------
+getMainForm().Splitter1.Visible = false
+getMainForm().Panel4.Visible = false
+getMainForm().Panel5.Visible = false
+
+local al = GetAddressList()
+al.Control[0].BackgroundColor = 0x000000
+al.Header.Visible = false
+for _, i in ipairs({2, 3, 4}) do
+  al.Header.Sections[i].MinWidth = 0
+  al.Header.Sections[i].MaxWidth = 0
+  al.Header.Sections[i].Width = 0
+end
+al.Header.Sections[1].MinWidth = 200
+al.Header.Sections[1].Width = 400
+
+-- 缩小激活(勾选框)列，让描述文字整体向左靠
+pcall(function()
+  al.Header.Sections[0].MinWidth = 0
+  al.Header.Sections[0].Width = 42
+end)
+
+-- ---------- 持久化全局函数（点位/半径/FPS限制） ----------
+-- 保存到 用户主目录\EldenRingFps：路径固定可预测，不受"文档"被重定向到
+-- D盘/OneDrive影响；os.getenv("USERPROFILE") 每台机器自动适配用户名
+function _G.AutoFps_GetSaveDir()
+  local up = os.getenv("USERPROFILE") or getCheatEngineDir()
+  local dir = up .. [[\EldenRingFps]]
+  pcall(createDir, dir)
+  return dir
+end
+
+function _G.AutoFps_GetSavePath()
+  return _G.AutoFps_GetSaveDir() .. [[\er_fps_save.txt]]
+end
+
+function _G.AutoFps_Save(cfg)
+  if not cfg or cfg == 0 then return false end
+  local f = io.open(_G.AutoFps_GetSavePath(), "w")
+  if not f then return false end
+  local radius = readFloat(cfg + 0x800)
+  local limit
+  pcall(function() limit = readFloat("ER_FPS_CUSTOM_LIMIT") end)
+  f:write("ERFPS1\n")
+  f:write("radius=" .. tostring(radius) .. "\n")
+  f:write("limit=" .. tostring(limit) .. "\n")
+  for i = 0, 79 do
+    local off = i * 24
+    local mID = readInteger(cfg + off)
+    if mID and mID ~= 0 then
+      local x = readFloat(cfg + off + 4)
+      local y = readFloat(cfg + off + 8)
+      local z = readFloat(cfg + off + 12)
+      local typ = readInteger(cfg + off + 16)
+      local fps = readFloat(cfg + off + 20)
+      f:write(string.format("%d,%d,%.6f,%.6f,%.6f,%d,%.6f\n",
+        i, mID, x, y, z, typ, fps))
+    end
+  end
+  f:close()
+  return true
+end
+
+function _G.AutoFps_Load(cfg)
+  if not cfg or cfg == 0 then return nil end
+  local f = io.open(_G.AutoFps_GetSavePath(), "r")
+  if not f then return nil end
+  local savedRadius, savedLimit
+  local header = f:read("*l")
+  if header ~= "ERFPS1" then f:close() return nil end
+  while true do
+    local line = f:read("*l")
+    if not line then break end
+    if line:sub(1, 7) == "radius=" then
+      savedRadius = tonumber(line:sub(8))
+    elseif line:sub(1, 6) == "limit=" then
+      savedLimit = tonumber(line:sub(7))
+    else
+      local parts = {}
+      for tok in line:gmatch("[^,]+") do parts[#parts + 1] = tok end
+      if #parts == 7 then
+        local slot = tonumber(parts[1])
+        local mID = tonumber(parts[2])
+        local x = tonumber(parts[3])
+        local y = tonumber(parts[4])
+        local z = tonumber(parts[5])
+        local typ = tonumber(parts[6])
+        local fps = tonumber(parts[7])
+        if slot and mID and x and y and z and typ and fps then
+          local off = slot * 24
+          writeInteger(cfg + off, mID)
+          writeFloat(cfg + off + 4, x)
+          writeFloat(cfg + off + 8, y)
+          writeFloat(cfg + off + 12, z)
+          writeInteger(cfg + off + 16, typ)
+          writeFloat(cfg + off + 20, fps)
+        end
+      end
+    end
+  end
+  f:close()
+  if savedRadius and savedRadius &gt; 0 then
+    writeFloat(cfg + 0x800, savedRadius)
+  end
+  return savedLimit
+end
+
+-- 只读取保存文件里的 limit（CE 重启、config 尚未分配时用）
+function _G.AutoFps_ReadSavedLimit()
+  local f = io.open(_G.AutoFps_GetSavePath(), "r")
+  if not f then return nil end
+  local result
+  if f:read("*l") == "ERFPS1" then
+    while true do
+      local line = f:read("*l")
+      if not line then break end
+      if line:sub(1, 6) == "limit=" then
+        result = tonumber(line:sub(7))
+        break
+      end
+    end
+  end
+  f:close()
+  return result
+end
+
+-- ---------- 配置 ----------
+local PROCESS_NAME = "eldenring.exe"
+local SYM_PATCH    = "ER_FPS_PATCH_ENABLED"
+local SYM_LIMIT    = "ER_FPS_CUSTOM_LIMIT"
+local REC_PATCH    = 1
+local INTERVAL_MS  = 1000
+local SETTLE_TICKS = 2
+local REINIT_COOLDOWN = 3
+local REINIT_BUDGET = 20
+local GRACE_TICKS  = 5
+
+local settle = 0
+local symbolsLoaded = false
+local initialized = false
+local checkboxSynced = false
+local reinitCooldown = 0
+local reinitBudget = 0
+local graceTicks = 0
+local lastLabel = nil
+local lastModules = nil
+
+if _G.__ER_FPS_PERSIST_TIMER then
+  pcall(function() _G.__ER_FPS_PERSIST_TIMER.destroy() end)
+  _G.__ER_FPS_PERSIST_TIMER = nil
+end
+
+local function patchRecord()
+  local ok, rec = pcall(function()
+    return getAddressList().getMemoryRecordByID(REC_PATCH)
+  end)
+  if ok then return rec end
+  return nil
+end
+
+local function setLabel(state)
+  -- 位置触发激活期间，ID1 描述完全交给位置 timer（[45 自动]/[OFF 自动]）
+  if _G.AutoFps_Active then return end
+  if state == lastLabel then return end
+  lastLabel = state
+  local rec = patchRecord()
+  if rec == nil then return end
+  pcall(function() rec.Description = "FPS Patch [" .. state .. "]" end)
+end
+
+local function moduleCount()
+  local ok, mods = pcall(enumModules)
+  if ok and mods ~= nil then return #mods end
+  return nil
+end
+
+local function symbolOk(sym)
+  local ok, a = pcall(getAddressSafe, sym)
+  if not ok then return false end
+  return a ~= nil and a ~= 0
+end
+
+local function readFlag()
+  local ok, b = pcall(readBytes, SYM_PATCH, 1, false)
+  if ok and type(b) == "number" then return b end
+  return nil
+end
+
+local function resetAttachState()
+  settle = SETTLE_TICKS
+  symbolsLoaded = false
+  initialized = false
+  checkboxSynced = false
+  reinitCooldown = 0
+  reinitBudget = REINIT_BUDGET
+  graceTicks = 0
+  lastModules = nil
+end
+
+if _G.__ER_FPS_WANTED == nil then
+  local rec = patchRecord()
+  _G.__ER_FPS_WANTED = (rec ~= nil) and rec.Active or false
+end
+
+local function tick()
+  -- 位置触发刚关闭时，强制重新同步一次 label
+  if _G.__ER_FPS_RESYNC then
+    lastLabel = nil
+    _G.__ER_FPS_RESYNC = nil
+  end
+  local pid = getProcessIDFromProcessName(PROCESS_NAME)
+  if pid == nil then
+    if symbolsLoaded or initialized then resetAttachState() end
+    symbolsLoaded = false
+    if _G.__ER_FPS_WANTED then setLabel("WAIT") else setLabel("OFF") end
+    return
+  end
+
+  if getOpenedProcessID() ~= pid then
+    pcall(openProcess, pid)
+    if getOpenedProcessID() == pid then resetAttachState() end
+    if _G.__ER_FPS_WANTED then setLabel("WAIT") else setLabel("OFF") end
+    return
+  end
+
+  if settle ~= 0 then
+    settle = settle - 1
+    if _G.__ER_FPS_WANTED then setLabel("WAIT") else setLabel("OFF") end
+    return
+  end
+
+  if reinitCooldown ~= 0 then reinitCooldown = reinitCooldown - 1 end
+
+  if not symbolsLoaded then
+    if symbolOk(SYM_PATCH) and symbolOk(SYM_LIMIT) then
+      symbolsLoaded = true
+    else
+      local mods = moduleCount()
+      local changed = (mods ~= nil) and (mods ~= lastModules)
+      if changed then lastModules = mods end
+      if changed and reinitCooldown == 0 and reinitBudget ~= 0 then
+        reinitBudget = reinitBudget - 1
+        reinitCooldown = REINIT_COOLDOWN
+        pcall(reinitializeSymbolhandler, false)
+      end
+      if _G.__ER_FPS_WANTED then setLabel("WAIT") else setLabel("OFF") end
+      return
+    end
+  end
+
+  if not initialized then
+    if _G.__ER_FPS_LAST_LIMIT == nil then
+      -- CE 重启后全局丢失，尝试从保存文件恢复上次帧率
+      local fl = _G.AutoFps_ReadSavedLimit()
+      if fl and fl &gt;= 20 and fl &lt;= 60 then
+        _G.__ER_FPS_LAST_LIMIT = fl
+      end
+    end
+    if _G.__ER_FPS_LAST_LIMIT ~= nil then
+      pcall(writeFloat, SYM_LIMIT, _G.__ER_FPS_LAST_LIMIT)
+      graceTicks = GRACE_TICKS
+    end
+    initialized = true
+  end
+
+  -- FPS限制行显示当前数值（值列已隐藏，用描述展示）
+  pcall(function()
+    local rec2 = getAddressList().getMemoryRecordByID(2)
+    if rec2 then
+      rec2.Description = string.format("FPS限制: %.1f", readFloat(SYM_LIMIT))
+    end
+  end)
+
+  -- 位置触发激活时，patch 字节控制权交给位置 timer，这里只做 FPS 持久化
+  local cur = readFlag()
+  if cur == nil then
+    symbolsLoaded = false
+    if _G.__ER_FPS_WANTED then setLabel("WAIT") else setLabel("OFF") end
+    return
+  end
+
+  if not _G.AutoFps_Active then
+    local target = 0
+    if _G.__ER_FPS_WANTED then target = 1 end
+    if cur ~= target then
+      pcall(writeBytes, SYM_PATCH, target)
+      local check = readFlag()
+      if check ~= nil then cur = check end
+    end
+  end
+
+  if _G.__ER_FPS_WANTED then
+    if cur == 1 then setLabel("ON") else setLabel("WAIT") end
+  else
+    setLabel("OFF")
+  end
+
+  if not _G.AutoFps_Active and _G.__ER_FPS_WANTED and cur == 1 and not checkboxSynced then
+    checkboxSynced = true
+    local rec = patchRecord()
+    if rec ~= nil and not rec.Active then
+      pcall(function() rec.Active = true end)
+    end
+  end
+
+  local okF, curLimit = pcall(readFloat, SYM_LIMIT)
+  if okF and type(curLimit) == "number" then
+    if graceTicks ~= 0 then
+      graceTicks = graceTicks - 1
+      if _G.__ER_FPS_LAST_LIMIT ~= nil and curLimit ~= _G.__ER_FPS_LAST_LIMIT then
+        pcall(writeFloat, SYM_LIMIT, _G.__ER_FPS_LAST_LIMIT)
+      end
+    else
+      _G.__ER_FPS_LAST_LIMIT = curLimit
+    end
+  end
+end
+
+local timer = createTimer(getMainForm())
+timer.Interval = INTERVAL_MS
+timer.OnTimer = function() pcall(tick) end
+_G.__ER_FPS_PERSIST_TIMER = timer
+
+-- 在界面上显示点位保存文件的实际路径，方便分发时知道 txt 放哪
+pcall(function()
+  if _G.AutoFps_GetSavePath then
+    local r151 = getAddressList().getMemoryRecordByID(151)
+    if r151 then r151.Description = "点位保存在: " .. _G.AutoFps_GetSavePath() end
+  end
+end)
+
+-- ---------- 双击开锁点行直接改帧数 ----------
+pcall(function()
+  local tree = getAddressList().List
+  tree.OnDblClick = function(sender)
+    pcall(function()
+      local al = getAddressList()
+      local rec = al.SelectedRecord or al.MouseHighlightedRecord()
+      if not rec then return end
+      local id = rec.ID
+      if id == 2 then
+        -- FPS 限制行：双击直接改 ER_FPS_CUSTOM_LIMIT
+        pcall(getMainForm().bringToFront)
+        local okL, curL = pcall(readFloat, "ER_FPS_CUSTOM_LIMIT")
+        local init = okL and string.format("%.0f", curL) or "60"
+        local newL = inputQuery("改帧数", "输入FPS限制(20-60):", init)
+        if newL == nil then return end
+        local v = tonumber(newL)
+        if not v or v &lt; 20 or v &gt; 60 then
+          showMessage("帧数需在20-60之间") return
+        end
+        pcall(writeFloat, "ER_FPS_CUSTOM_LIMIT", v)
+      elseif id &gt;= 200 and id &lt;= 239 then
+        if not _G.AutoFps_Config then return end
+        local slot = _G.AutoFps_EntrySlot and _G.AutoFps_EntrySlot[id]
+        if slot == nil then return end
+        pcall(getMainForm().bringToFront)
+        local curFps = readFloat(_G.AutoFps_Config + slot*24 + 20)
+        local newFps = inputQuery("改帧数", "输入该开锁点新帧数(20-60):",
+          string.format("%.0f", curFps))
+        if newFps == nil then return end
+        local fps = tonumber(newFps)
+        if not fps or fps &lt; 20 or fps &gt; 60 then
+          showMessage("帧数需在20-60之间") return
+        end
+        writeFloat(_G.AutoFps_Config + slot*24 + 20, fps)
+        local okb, b = pcall(readBytes, "ER_FPS_PATCH_ENABLED", 1, false)
+        if okb and b == 1 then
+          pcall(writeFloat, "ER_FPS_CUSTOM_LIMIT", fps)
+        end
+        if _G.AutoFps_Save then _G.AutoFps_Save(_G.AutoFps_Config) end
+      end
+    end)
+  end
+end)
+
+-- ---------- 统一恢复：非手动锁帧时写 patch=0 解除，并保存点位 ----------
+function _G.AutoFps_FullRestore()
+  pcall(function()
+    local al = getAddressList()
+    local r1 = al.getMemoryRecordByID(1)
+    local manual = (r1 ~= nil) and r1.Active
+    if not manual then
+      pcall(writeBytes, "ER_FPS_PATCH_ENABLED", 0)
+      _G.__ER_FPS_WANTED = false
+    end
+    if _G.AutoFps_Config and _G.AutoFps_Save then
+      _G.AutoFps_Save(_G.AutoFps_Config)
+    end
+  end)
+end
+
+-- 直接关闭 CE 主窗口（不点开关）时，DISABLE 脚本可能不执行，
+-- 用 OnClose 兜底，确保退出时游戏恢复原生帧率。
+-- 必须返回传入的 CloseAction(ca)，否则默认 caNone 会导致窗口关不掉。
+pcall(function()
+  local oldOnClose = getMainForm().OnClose
+  getMainForm().OnClose = function(sender, ca)
+    _G.AutoFps_FullRestore()
+    if oldOnClose then
+      return oldOnClose(sender, ca)
+    else
+      return ca
+    end
+  end
+end)
+
+-- ---------- FPS Patch(ID1) 与位置锁帧(ID101) 互斥 ----------
+-- OnActivate 在 before=true 时返回 false 可阻止本次激活
+pcall(function()
+  local al = getAddressList()
+  local r1 = al.getMemoryRecordByID(1)
+  local r101 = al.getMemoryRecordByID(101)
+
+  r1.OnActivate = function(rec, before, state)
+    if before and r101.Active then
+      pcall(getMainForm().bringToFront)
+      showMessage("请先关闭位置触发自动锁帧，再开启 FPS Patch")
+      return false
+    end
+    return true
+  end
+
+  r101.OnActivate = function(rec, before, state)
+    if before and r1.Active then
+      pcall(getMainForm().bringToFront)
+      showMessage("请先关闭 FPS Patch，再启用位置触发自动锁帧")
+      return false
+    end
+    return true
+  end
+end)</LuaScript>
+</CheatTable>
