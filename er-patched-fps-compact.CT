@@ -69,6 +69,12 @@ pcall(writeBytes, "ER_FPS_PATCH_ENABLED", 0)</AssemblerScript>
           <Color>00FFFF</Color>
           <GroupHeader>1</GroupHeader>
         </CheatEntry>
+        <CheatEntry>
+          <ID>8</ID>
+          <Description>"祝你们速通顺利！Good luck with your speedruns!"</Description>
+          <Color>00FF00</Color>
+          <GroupHeader>1</GroupHeader>
+        </CheatEntry>
       </CheatEntries>
     </CheatEntry>
     <CheatEntry>
